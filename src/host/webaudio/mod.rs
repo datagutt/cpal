@@ -109,6 +109,11 @@ const SUPPORTED_SAMPLE_FORMAT: SampleFormat = SampleFormat::F32;
 
 const DEFAULT_BUFFER_SIZE: usize = 2048;
 
+// How far ahead of the context clock a buffer is scheduled after an underrun: two render quanta
+// of 128 frames, so the audio thread receives the source before its start time.
+// https://webaudio.github.io/web-audio-api/#render-quantum
+const RESYNC_LEAD_FRAMES: usize = 256;
+
 // Minimum initial timer delay mandated by the HTML spec.
 // https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#timers
 const INITIAL_TIMEOUT_MS: i32 = 4;
@@ -320,6 +325,7 @@ impl DeviceTrait for Device {
                 ),
             )
         })?;
+        let resync_lead_secs = buffer_time_step_secs(RESYNC_LEAD_FRAMES, config.sample_rate);
         let buffer_time_step_secs = buffer_time_step_secs(buffer_size_frames, config.sample_rate);
 
         // Keep `playback` monotonic: outputLatency can drop (e.g. the page calls `setSinkId()` to
@@ -435,18 +441,33 @@ impl DeviceTrait for Device {
                     current_time_bits_handle.store(now.to_bits(), Ordering::Relaxed);
 
                     let time_at_start_of_buffer = {
-                        let time_at_start_of_buffer = time_handle
+                        let time_at_start_of_buffer = *time_handle
                             .read()
                             .expect("Unable to get a read lock on the time cursor");
-                        // Synchronise first buffer as necessary (eg. keep the time value
-                        // referenced to the context clock).
-                        if *time_at_start_of_buffer > 0.0 {
-                            *time_at_start_of_buffer
-                        } else {
+                        if time_at_start_of_buffer <= 0.0 {
                             // Schedule the first buffer far enough ahead for the browser's
                             // internal audio pipeline (baseLatency) plus one full buffer of
                             // data, so playback starts underrun-free at any buffer size.
                             now + base_latency_secs + buffer_time_step_secs
+                        } else if time_at_start_of_buffer < now {
+                            // The previous buffers finished before this callback ran, as they
+                            // do when the page's thread is busy for longer than a buffer. A
+                            // source started in the past plays at once, so scheduling at the
+                            // cursor would make every following buffer overlap the one before
+                            // until the cursor caught up with the clock again, which sounds
+                            // like crackling for as long as the stall lasted. Resynchronise to
+                            // the clock instead and report the underrun.
+                            (error_callback_handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()))(
+                                Error::with_message(
+                                    ErrorKind::Xrun,
+                                    "Audio was not queued in time; the page's thread was busy",
+                                ),
+                            );
+                            now + resync_lead_secs
+                        } else {
+                            time_at_start_of_buffer
                         }
                     };
 
